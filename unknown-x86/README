@@ -1,0 +1,171 @@
+README
+
+This, the unknown-x86 program uses XED to compare Dyninst's
+instruction parsing with XED and looks for three things:
+
+  1. Unknown instructions that dyninst doesn't recognize but XED says
+  are valid.  This uses the InstructionDecoder::unknown_instruction
+  callback function.
+
+  2. Instructions that dyninst accepts but have the wrong length
+  according to XED.  These can also appear as a trolled region from an
+  unknown instn where dyninst mis-parses the previous instn.
+
+  3. Unclaimed regions (gaps) between basic blocks.
+
+Note: this test uses XED and thus only runs on x86_64.
+
+Mark W. Krentel
+Rice University
+June 2023
+
+Copyright (c) 2023, Rice University, see LICENSE for details.
+
+https://github.com/dyninst/dyninst
+https://github.com/intelxed/xed
+
+Currently (June 2023), Dyninst does not cover the AVX 512 instructions
+for Intel Sapphire Rapids.  Also, dyninst had some bugs with some
+instruction lengths that were recently fixed.
+
+This program requires Dyninst's unknown_instruction API which is in
+dyninst master, but not in 12.3.0 release.
+
+Dyninst fixed the wrong length bugs in master commit 9696c64a3a1d.  If
+you want examples of the wrong length bugs, use the previous commit
+44d86e56068f.
+
+libmkl_avx512.so.2 from Intel Oneapi MKL is a good test binary.
+
+https://github.com/dyninst/dyninst/issues/1409
+
+----------------------------------------------------------------------
+
+HOW TO BUILD
+
+First, build dyninst and intel-xed with spack.  This includes the
+boost, elfutils and intel-tbb prerequisites.
+
+Then edit the 'mk-test.sh' script for the paths (install prefixes) for
+spack, dyninst, boost, etc, and run:
+
+  ./mk-test.sh
+
+Note: it's Ok to build a custom dyninst (outside of spack), but be
+sure to set the BOOST, ELF and TBB paths consistent with the prereqs
+you used to build dyninst.
+
+https://spack.readthedocs.io/en/latest/index.html
+
+----------------------------------------------------------------------
+
+HOW TO RUN
+
+usage:  unknown-x86  [options]...  filename
+
+options:
+  -j num        use num openmp threads for parse phase (default 1)
+  -q            turn off all output except for summary
+  --fix         attempt to fix unknown instructions (default no)
+  --fix-all     attempt to fix all unknown and trolled instructions
+  --no-fix      do not fix any instructions
+  -h, --help    display usage message and exit
+
+By default, the test does not try to fix unknown instructions, use
+option '--fix' to turn that on.
+
+Note: For some reason, fixing trolls seems to be dangerous and can
+lead to dyninst crashing (or going into an infinite loop).
+
+----------------------------------------------------------------------
+
+SAMPLE OUTPUT
+
+Phase 1 displays the buffer for every call to the callback function.
+These are all instances where Dyninst expects there should be an
+instruction but can't parse it.
+
+  $ ./unknown-x86 --fix libmkl_avx512_iris.so
+
+  phase 1 -- parse binary and test for unknown instructions ...
+  unknown:  c5 fb 92 c8 c4 e1 f9 44 c9 48 89 f1 48 83 e1 1f  valid: 4  (fix)
+  unknown:  62 b3 7d 40 43 c1 88 62 b3 7d 40 43 c9 dd 62 f3  valid: 7  (fix)
+  unknown:  62 56 7d 58 b8 87 00 fe ff ff 62 56 7d 58 b8 8f  valid: 10  (fix)
+  unknown:  07 62 42 ed 40 b6 24 01 4c 8b 8d 90 f9 ff ff 62  troll: 1  len: 7
+  ...
+
+In the first three cases, XED says these represent a valid x86_64
+instruction, and we return a "fake no-op" with 4, 7 and 10 bytes.
+Dyninst accepts the instructions and continues parsing.
+
+Unfortunately, at the point where dyninst invokes the callback
+function, the address of the instruction is not known and all we get
+is a buffer of bytes.  However, scanning the output of "objdump -dw",
+we find examples of these instructions.
+
+  609a8d:      c5 fb 92 c8             kmovd  %eax,%k1
+  609b98:      62 b3 7d 40 43 c1 88    vshufi32x4 $0x88,%zmm17,%zmm16,%zmm0
+  a40a30:      62 56 7d 58 b8 87 00 fe ff ff   vfmadd231ph -0x200(%r15){1to32},%zmm0,%zmm8
+
+In the fourth case (troll), the buffer does not begin with a valid
+instruction, but if we skip ahead 1 byte, then "62 42 ed 40 b6 24 01"
+is a valid 7-byte instruction.  In this case, dyninst got the length
+of the previous instruction wrong, and so the instruction parsing got
+out of sync.
+
+  3918a1a:     62 81 ff 48 12 54 26 07    vmovddup 0x1c0(%r14,%r12,1),%zmm18
+  3918a22:     62 42 ed 40 b6 24 01    vfmaddsub231pd (%r9,%rax,1),%zmm18,%zmm28
+
+Note: it's best to use a very recent version of objdump, 2.40 or
+later.
+
+----------
+
+Phase 2 examines every instruction in every block of the Control-Flow
+Graph (CFG), compares the lengths of the instruction according to
+Dyninst and XED, and reports any differences.
+
+  phase 2 -- test known instructions for bad length ...
+  bad length at 0x1d9971:   62 c3 fd 28 01 5c c8 00 00 00 00 00 00 00 00 00  dyn: 7  xed: 9
+  bad length at 0x2de219c:  62 b1 fd 48 7a 24 eb 62 00 00 00 00 00 00 00 00  dyn: 6  xed: 7
+  ...
+
+In this case, we know the address of the instruction.  In virtually
+all cases, XED agrees with objdump.
+
+   1d9971:       62 c3 fd 28 01 5c c8 fe 1b    vpermpd $0x1b,-0x40(%r8,%rcx,8),%ymm19
+  2de219c:       62 b1 fd 48 7a 24 eb    vcvttpd2qq (%rbx,%r13,8),%zmm4
+
+----------
+
+Phase 3 sorts every block in the CFG and compares adjacent blocks and
+reports on any gaps (unclaimed regions) between blocks.  Normally, one
+block starts where the previous one ends.  A small gap is probably
+just for cache alignment and is harmless.  But a large gap might be
+the result of an instruction that dyninst missed and then stopped
+processing.
+
+  phase 3 -- test for gaps between blocks ...
+  gap: prev block: 0x19e5180  end: 0x19e51c0  next: 0x19ecfa0  size: 0x7de0 (32224)
+
+In this case, there is a large gap (32K bytes and 250 functions) where
+one block ends at 0x19e51c0 and the next one begins at 0x19ecfa0.
+
+  00000000019e5180 <mkl_xblas_avx512_blas_zwaxpby_z_d_x>:
+   19e5180:       41 57                   push   %r15
+   19e5182:       4c 8b 7c 24 10          mov    0x10(%rsp),%r15
+   ...
+   19e51b4:       4c 89 5c 24 10          mov    %r11,0x10(%rsp)
+   19e51b9:       41 5f                   pop    %r15
+   19e51bb:       e9 40 40 72 fe          jmp    109200 <mkl_xblas_avx512_BLAS_zwaxpby_z_d_x@plt>
+
+  00000000019e51c0 <mkl_dft_avx512_dft_row_ccopy_16_r_mod8>:
+   19e51c0:       c5 f8 77                vzeroupper
+   19e51c3:       53                      push   %rbx
+   19e51c4:       55                      push   %rbp
+   ...
+
+  00000000019ecfa0 <commit>:
+   19ecfa0:       55                      push   %rbp
+   19ecfa1:       48 89 e5                mov    %rsp,%rbp
+
