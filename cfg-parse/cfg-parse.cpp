@@ -116,10 +116,15 @@ public:
     int	  jobs_parse;
     int	  jobs_struct;
     bool  show_blocks;
+    bool  show_edges;
     bool  show_stmts;
     bool  show_inline;
     bool  show_linemap;
+    bool  show_noreturn;
+    bool  show_dup_edges;
     bool  show_time;
+    bool  space_per_func;
+    bool  space_per_block;
 
   Options() {
 	filename = NULL;
@@ -127,10 +132,15 @@ public:
 	jobs_parse  = 4;
 	jobs_struct = 1;
 	show_blocks = true;
+	show_edges = true;
 	show_stmts = true;
 	show_inline = true;
 	show_linemap = true;
+	show_noreturn = true;
+	show_dup_edges = true;
 	show_time = false;
+	space_per_func = false;
+	space_per_block = true;
     }
 };
 
@@ -163,10 +173,17 @@ BlockLessThan(Block * b1, Block * b2)
 }
 
 // Order Edges by target address, low to high.
+// In case of duplicate edges, resolve ties by edge type.
 static bool
 EdgeLessThan(Edge * e1, Edge * e2)
 {
-    return e1->trg()->start() < e2->trg()->start();
+    Block * b1 = e1->trg();
+    Block * b2 = e2->trg();
+
+    if (b1->start() < b2->start()) { return true; }
+    if (b1->start() > b2->start()) { return false; }
+
+    return e1->type() < e2->type();
 }
 
 // Order Functions by entry address, low to high.
@@ -301,17 +318,21 @@ doBlock(Block * block)
     Block::Insns imap;
     block->getInsns(imap);
 
+    if (opts.space_per_block) {
+	cout << "\n";
+    }
+
     // basic blocks
     if (opts.show_blocks) {
 	int num_funcs = block->containingFuncs();
 
-	cout << "\nblock: " << HEX(block->start()) << "--" << HEX(block->end())
+	cout << "block: " << HEX(block->start()) << "--" << HEX(block->end())
 	     << " (" << imap.size() << ", " << block->size() << ")";
 
+	// blocks can belong to multiple functions
 	if (num_funcs > 1) {
 	    vector <ParseAPI::Function *> Funcs;
 	    block->getFuncs(Funcs);
-
 	    std::sort(Funcs.begin(), Funcs.end(), FuncLessThan);
 
 	    cout << "  funcs: (" << num_funcs << ")";
@@ -334,32 +355,61 @@ doBlock(Block * block)
     }
 
     // out edges
-    if (opts.show_blocks) {
+    if (opts.show_edges) {
 	const Block::edgelist & outEdges = block->targets();
 	vector <Edge *> edgeVec;
 
+	// sort edges by target address
 	for (auto eit = outEdges.begin(); eit != outEdges.end(); ++eit) {
 	    edgeVec.push_back(*eit);
 	}
 	std::sort(edgeVec.begin(), edgeVec.end(), EdgeLessThan);
 
-	cout << "out edges: " << HEX(block->last())
-	     << " (" << edgeVec.size() << ")";
+	// count unique edges
+	uint num_edges = edgeVec.size();
+	uint num_unique = 0;
+	Address prev_start = 0;
 
-	for (auto eit = edgeVec.begin(); eit != edgeVec.end(); ++eit) {
-	    Edge * edge = *eit;
+	for (uint i = 0; i < num_edges; i++) {
+	    Block * target = edgeVec[i]->trg();
+	    if (i == 0 || target->start() != prev_start) {
+		num_unique++;
+	    }
+	    prev_start = target->start();
+	}
+
+	cout << "out edges: " << HEX(block->last())
+	     << " (" << num_edges;
+
+	if (opts.show_dup_edges && num_unique < num_edges) {
+	    cout << "/" << num_unique;
+	}
+	cout << ")";
+
+	// display the edges
+	prev_start = 0;
+	for (uint i = 0; i < num_edges; i++) {
+	    Edge * edge = edgeVec[i];
 	    Block * target = edge->trg();
 
-	    cout << "  " << HEX(target->start())
-		 << " (" << edgeType(edge->type());
+	    // show unique edges, or all if show-dup-edges
+	    if (opts.show_dup_edges || i == 0 || target->start() != prev_start) {
+		cout << "  " << HEX(target->start())
+		     << " (" << edgeType(edge->type());
 
-	    if (edge->interproc()) {
-		cout << ", interproc";
+		if (edge->interproc()) {
+		    cout << ", interproc";
+		}
+		if (opts.show_noreturn && edge->type() == ParseAPI::CALL
+		    && isNoreturn(target)) {
+		    cout << ", noreturn";
+		}
+		if (i != 0 && target->start() == prev_start) {
+		    cout << ", DUP";
+		}
+		cout << ")";
 	    }
-	    if (edge->type() == ParseAPI::CALL && isNoreturn(target)) {
-		cout << ", noreturn";
-	    }
-	    cout << ")";
+	    prev_start = target->start();
 	}
 	cout << "\n";
     }
@@ -386,15 +436,17 @@ doFunction(ParseAPI::Function * func)
 
     if (opts.show_blocks) {
 	cout << "  (" << blockVec.size() << ", " << bytes;
-	if (func->retstatus() == ParseAPI::NORETURN) {
+	if (opts.show_noreturn && func->retstatus() == ParseAPI::NORETURN) {
 	    cout << ", noreturn";
 	}
 	cout << ")";
     }
+    else if (opts.show_noreturn && func->retstatus() == ParseAPI::NORETURN) {
+	cout << "  (noreturn)";
+    }
     cout << "  " << func->name() << "\n";
 
-    // adjust blank lines, depending on output
-    if (opts.show_stmts && ! opts.show_blocks) {
+    if (opts.space_per_func) {
 	cout << "\n";
     }
 
@@ -419,11 +471,16 @@ usage(string mesg)
 	 << "  -j, --jobs num          num omp threads for all phases\n"
 	 << "  --jobs-symtab num       num threads for symtab and line map\n"
 	 << "  --jobs-parse num        num threads for parse phase\n"
-	 << "  -A, +A                  disable (enable) all optional output\n"
-	 << "  -B, +B                  omit (show) basic blocks and out edges\n"
+	 << "  --all                   enable all optional output (default)\n"
+	 << "  --none                  disable all optional output\n"
+	 << "  -B, +B                  omit (show) basic blocks\n"
+	 << "  -E, +E                  omit (show) out edges\n"
 	 << "  -S, +S                  omit (show) statements (instructions)\n"
 	 << "  -I, +I                  omit (show) inline sequences\n"
 	 << "  -L, +L                  omit (show) line map info\n"
+	 << "  -R, +R                  omit (show) noreturn status on functions\n"
+	 << "                          and call edges\n"
+	 << "  --omit-dup-edges        dont show duplicate out edges\n"
 	 << "  --time                  display time and memory usage\n"
 	 << "  -h, --help              display usage message and exit\n"
 	 << "\noptions are processed left to right.\n"
@@ -482,23 +539,37 @@ getOptions(int argc, char **argv, Options & opts)
 	}
 
 	// blocks, edges, stmts
-	else if (arg == "-A") {
-	    opts.show_blocks = false;
-	    opts.show_stmts = false;
-	    opts.show_inline = false;
-	    opts.show_linemap = false;
-	}
-	else if (arg == "+A") {
+	else if (arg == "--all") {
 	    opts.show_blocks = true;
+	    opts.show_edges = true;
 	    opts.show_stmts = true;
 	    opts.show_inline = true;
 	    opts.show_linemap = true;
+	    opts.show_noreturn = true;
+	    opts.show_dup_edges = true;
+	}
+	else if (arg == "--none") {
+	    opts.show_blocks = false;
+	    opts.show_edges = false;
+	    opts.show_stmts = false;
+	    opts.show_inline = false;
+	    opts.show_linemap = false;
+	    opts.show_noreturn = false;
+	    opts.show_dup_edges = false;
 	}
 	else if (arg == "-B") {
 	    opts.show_blocks = false;
 	}
 	else if (arg == "+B") {
 	    opts.show_blocks = true;
+	}
+	else if (arg == "-E") {
+	    opts.show_edges = false;
+	}
+	else if (arg == "+E") {
+	    opts.show_edges = true;
+	    opts.show_noreturn = true;
+	    opts.show_dup_edges = true;
 	}
 	else if (arg == "-S") {
 	    opts.show_stmts = false;
@@ -526,8 +597,17 @@ getOptions(int argc, char **argv, Options & opts)
 	    opts.show_linemap = true;
 	    opts.show_stmts = true;
 	}
+	else if (arg == "-R") {
+	    opts.show_noreturn = false;
+	}
+	else if (arg == "+R") {
+	    opts.show_noreturn = true;
+	}
 
 	// other
+	else if (arg == "--omit-dup-edges") {
+	    opts.show_dup_edges = false;
+	}
 	else if (arg == "--time") {
 	    opts.show_time = true;
 	}
@@ -550,6 +630,14 @@ getOptions(int argc, char **argv, Options & opts)
     else {
 	usage("missing file name");
     }
+
+    // add blank line per block or per function depending on what
+    // items are turned on
+    int num_items = (opts.show_blocks ? 1 : 0)
+        + (opts.show_stmts ? 1 : 0) + (opts.show_edges ? 1 : 0);
+
+    opts.space_per_func = (num_items == 1);
+    opts.space_per_block = (num_items >= 2);
 }
 
 //----------------------------------------------------------------------
